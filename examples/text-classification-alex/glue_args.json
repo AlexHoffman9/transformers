@@ -1,0 +1,13 @@
+{"data_dir":"/home/ahoffman/research/transformers/data/glue/MRPC",
+"model_type":"bert",
+"model_name_or_path":"bert-base-cased",
+"task_name":"mrpc",
+"output_dir":"/home/ahoffman/research/transformers/examples/text-classification-alex/runs",
+"do_train":"True",
+"do_eval":"True",
+"max_seq_length":128,
+"per_device_train_batch_size": 32,
+"learning_rate": 2e-5,
+"num_train_epochs": 3.0,
+"overwrite_output_dir":"True"
+}
