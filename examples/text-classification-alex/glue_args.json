@@ -1,13 +1,16 @@
 {"data_dir":"/home/ahoffman/research/transformers/data/glue/MRPC",
 "model_type":"bert",
-"model_name_or_path":"bert-base-cased",
+"model_name_or_path":"bert-base-uncased",
+"model_name_or_pathdd":"google/mobilebert-uncased",
 "task_name":"mrpc",
-"output_dir":"/home/ahoffman/research/transformers/examples/text-classification-alex/runs",
-"do_train":"True",
+"output_dir":"/home/ahoffman/research/transformers/examples/text-classification-alex/out",
 "do_eval":"True",
+"evaluation_strategy":"epoch",
+"do_predict":"True",
 "max_seq_length":128,
-"per_device_train_batch_size": 32,
+"per_device_train_batch_size": 64,
 "learning_rate": 2e-5,
-"num_train_epochs": 3.0,
-"overwrite_output_dir":"True"
+"num_train_epochs": 6.0,
+"overwrite_output_dir":"True",
+"__comment":"TrainingArguments in huggingface docs shows all possible params"
 }

@@ -62,7 +62,7 @@ class ModelArguments:
 
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-
+import time
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -78,6 +78,8 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # easy way to modify args, could insert for loop here to do hyperparam search (trainer does it too)
+    # training_args.model_name_or_path = "bert-base-uncased"
 
     if (
         os.path.exists(training_args.output_dir)
@@ -137,6 +139,18 @@ def main():
         cache_dir=model_args.cache_dir,
     )
 
+
+
+    from transformers import AutoModel
+    print('\nsequence classification model params')
+    # print(model.named_parameters())
+    for name,param in model.named_parameters():
+        if "classifier" in name: print(name)
+    model_testing = AutoModel.from_pretrained("google/mobilebert-uncased")
+    print('\nmlm model params')
+    for name,param in model_testing.named_parameters():
+        if "classifier" in name: print(name)
+
     # Get datasets
     train_dataset = (
         GlueDataset(data_args, tokenizer=tokenizer, cache_dir=model_args.cache_dir) if training_args.do_train else None
@@ -163,16 +177,16 @@ def main():
 
         return compute_metrics_fn
 
-    logdir = training_args.output_dir +'/'+ datetime.now().strftime("%Y%m%d-%H%M%S")
-    writer = SummaryWriter(log_dir=logdir)
+    # logdir = training_args.output_dir +'/'+ datetime.now().strftime("%Y%m%d-%H%M%S")
+    # writer = SummaryWriter(log_dir=logdir)
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        compute_metrics=build_compute_metrics_fn(data_args.task_name),
-        tb_writer=writer
+        compute_metrics=build_compute_metrics_fn(data_args.task_name)
+        # tb_writer=writer
     )
 
     # Training
@@ -201,8 +215,11 @@ def main():
 
         for eval_dataset in eval_datasets:
             trainer.compute_metrics = build_compute_metrics_fn(eval_dataset.args.task_name)
+            then = time.time()
             eval_result = trainer.evaluate(eval_dataset=eval_dataset)
-
+            elapsed = time.time()-then
+            print("Eval took {} seconds".format(elapsed))
+            print("throughput: {} inf/sec".format(len(eval_dataset)/elapsed))
             output_eval_file = os.path.join(
                 training_args.output_dir, f"eval_results_{eval_dataset.args.task_name}.txt"
             )
