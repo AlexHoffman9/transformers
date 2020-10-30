@@ -44,6 +44,7 @@ from transformers import glue_convert_examples_to_features as convert_examples_t
 from transformers import glue_output_modes as output_modes
 from transformers import glue_processors as processors
 import datetime
+from group_regularization import group_lasso
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -89,7 +90,6 @@ def schedule_threshold(
     regu_lambda = final_lambda * threshold / final_threshold
     return threshold, regu_lambda
 
-# adding group lasso regularization
 def regularization(model: nn.Module, mode: str):
     regu, counter = 0, 0
     for name, param in model.named_parameters():
@@ -98,19 +98,17 @@ def regularization(model: nn.Module, mode: str):
                 regu += torch.norm(torch.sigmoid(param), p=1) / param.numel()
             elif mode == "l0":
                 regu += torch.sigmoid(param - 2 / 3 * np.log(0.1 / 1.1)).sum() / param.numel()
-            # elif mode == "l1_row": # group lasso rows with L1 regularization
-            #     # sum of L2 norms of rows of weight matrix
             else:
                 ValueError("Don't know this mode.")
             counter += 1
-    return regu / counter
+    return regu/counter
 
 
 def train(args, train_dataset, model, tokenizer, teacher=None):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         dt = datetime.datetime.now()
-        dt_string = dt.strftime("%m-%d-(%H:%M)")+args.pruning_method+'_'+str(args.final_threshold)
+        dt_string = dt.strftime("%m-%d-(%H:%M)")+args.pruning_method+'_'+str(args.final_threshold)+args.tfwriter_dir_append
         tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir,dt_string))
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
@@ -302,9 +300,16 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                 loss = args.alpha_distil * loss_logits + args.alpha_ce * loss
 
             # Regularization
-            if args.regularization is not None:
-                regu_ = regularization(model=model, mode=args.regularization)
-                loss = loss + regu_lambda * regu_
+            # commented out because I'm doing my own weight regularization
+            # if args.regularization is not None:
+            #     regu_ = regularization(model=model, mode=args.regularization)
+            #     loss = loss + regu_lambda * regu_
+                
+            # group regularization
+            if args.regularization == "group_lasso": # regularizing weights
+                regu_ = group_lasso(model, args.pruning_method)
+                # loss = loss + regu_lambda * regu_group # trying the default regularization lambda which scales with pruning threshold (makes sense to match sparsity to pruning thresh)
+                loss = loss + args.final_lambda * regu_
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -602,7 +607,7 @@ def main():
     )
     parser.add_argument(
         "--output_dir",
-        default='/home/ahoffman/research/transformers/examples/alex/struct-pruning/glue_out',
+        default='/home/ahoffman/research/transformers/examples/alex/glue_out',
         type=str,
         # required=True,
         help="The output directory where the model predictions and checkpoints will be written.",
@@ -801,6 +806,7 @@ def main():
         "See details at https://nvidia.github.io/apex/amp.html",
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--tfwriter_dir_append", type=str, default='', help="add this to the end of the tfwriter directory name")
 
     args = parser.parse_args()
 

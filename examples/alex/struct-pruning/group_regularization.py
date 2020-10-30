@@ -2,11 +2,17 @@
 import torch
 import transformers
 
-def group_lasso(model, row=True):
+
+def group_lasso(model: torch.nn.Module, pruning_method: str):
+    '''
+    L1 regularization of groups of weights in weight matrix to encourage sparsity \\
+    row=True regularizes rows, row=False regularizes cols\\
+    ignores bias, layernorm, embedding params
+    '''
     reg, layer_count = 0.0, 0.0
-    filter_out = ["bias", "LayerNorm"]
+    filter_out = ["bias", "LayerNorm", "embed"]
     group_dim=1
-    if not row:
+    if pruning_method == 'col':
         group_dim=0
     for name, param in model.named_parameters():
         if not any(key in name for key in filter_out): # only fc weight matrices
@@ -17,8 +23,9 @@ def group_lasso(model, row=True):
     return reg / layer_count
 
 
-model = transformers.AutoModel.from_pretrained('bert-base-uncased')
-print(group_lasso(model, True))
+if __name__=="__main__":
+    model = transformers.AutoModel.from_pretrained('bert-base-uncased')
+    print(group_lasso(model, True))
 # for name, param in model.named_parameters():
 #     filter_out = ["bias", "LayerNorm"]
 #     if not any(key in name for key in filter_out): # only fully connected layers

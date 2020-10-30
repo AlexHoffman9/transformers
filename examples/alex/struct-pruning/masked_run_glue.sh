@@ -3,10 +3,17 @@
 SERIALIZATION_DIR=./glue_out
 GLUE_DATA=/home/ahoffman/research/transformers/data/glue/MRPC
 export CUDA_VISIBLE_DEVICES=0
-for thresh in 0.5 0.3
-do
-/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py --final_threshold $thresh --pruning_method row
-done
+/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
+--model_type bert --num_train_epochs 10 --per_gpu_train_batch_size 16 --initial_warmup 8 --max_seq_length 256 --learning_rate 2e-5 --tfwriter_dir_append sota_attempt
+
+# See if pruning is affecting gradient prop
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
+# --final_threshold 0.9 --pruning_method magnitude --num_train_epochs 10  --initial_warmup 8
+# for lambda in 0.0
+# do
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
+# --final_threshold 0.5 --pruning_method row --regularization group_lasso --num_train_epochs 6 --final_lambda $lambda --initial_warmup 8
+# done
 # /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_run_glue.py \
 #     --output_dir $SERIALIZATION_DIR --overwrite_output_dir \
 #     --data_dir $GLUE_DATA \
