@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import Parameter
 from torch.optim import SGD
+from torch.utils.data import SubsetRandomSampler
 
 
 from modules.binarizer import L1ColBinarizer, L1RowBinarizer, MagnitudeBinarizer
@@ -107,6 +108,11 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
                                     (0.1307,), (0.3081,))
                                 ]))
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=32, shuffle=True)
+    
+    # use a smaller fine-tuning dataset during pruning to simulate transfer learning
+    transfer_size_factor = 10
+    transfer_sampler = SubsetRandomSampler(range(int(len(train_data)/transfer_size_factor))) # only sample from first tenth of dataset for transfer set
+    transfer_loader = torch.utils.data.DataLoader(train_data, batch_size=32, sampler=transfer_sampler) 
 
     test_batch_size=128
     test_data = torchvision.datasets.MNIST('/home/ahoffman/research/transformers/examples/alex/struct-pruning/emmental', train=False, download=True,
@@ -123,7 +129,7 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
     if os.path.exists(model_dir):
         model.load_state_dict(torch.load(model_dir), strict=False) # saved model doesn't have mask scores
         model = model.to(device)
-        print('loaded pretrained weights')
+        print('loaded pretrained weights from ', model_dir)
     target_dims = {'lin1.mask_scores': 28*28-50}
     sparsity=1.0
     optimizer = torch.optim.SGD(model.parameters(), lr=.01)
@@ -134,21 +140,13 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
         for name, param in model.named_parameters():
             if "mask_scores" in name: # learn mask scores, mask stays frozen
                 param.requires_grad = True
-            else:                # freeze weights
+            else:                     # freeze weights
                 param.requires_grad = False
-        for epoch in range(1): # train scores for one epoch
+        # train scores for one epoch
+        for epoch in range(1): 
             print('\nlearning scores, sparsity:', sparsity)
             mnist_eval(model, test_loader, device)
-            cum_loss = mnist_train(model, optimizer, train_loader, device, reg_lambda)
-            
-            # check neuron scores to see if they are diverging a bit
-            scores, idx = model.lin1.mask_scores.sort()
-            # print("regularization training epoch ", epoch)
-            # print('mask scores mean: ', scores.mean(), 'std: ', scores.std()) # shoudl be 1 and 0
-            # print(scores[:10], scores[-10:])
-            # check if weights are growing to compensate. they are...
-            weight = model.lin1.weight.data.abs()
-            # print('lin1 weight mean', weight.mean())
+            cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda)
         # torch.save(model.state_dict(), model_dir) # added to save pretrained model
 
         # fine tune weights for an epoch
@@ -163,7 +161,7 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
         print('acc after pruning to sparsity:', sparsity)
         mnist_eval(model, test_loader, device)
         for epoch in range(1):
-            cum_loss = mnist_train(model, optimizer, train_loader, device, reg_lambda) # masks frozen so regularization has no effect
+            cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda) # masks frozen so regularization has no effect
         print('fine-tuned acc after pruning to sparsity:', sparsity, 'and one epoch fine-tuning')
         mnist_eval(model, test_loader, device)
     
@@ -171,21 +169,18 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
     max_acc=0
     convergence=0
     while convergence<2:
-        cum_loss = mnist_train(model, optimizer, train_loader, device, reg_lambda) # masks frozen so regularization has no effect
+        cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda) # masks frozen so regularization has no effect
         acc = mnist_eval(model, test_loader, device)
         if acc <= max_acc+.002:
             convergence += 1
         else:
             convergence = 0
-        max_acc = max(max_acc, acc)
-
-
-        
-           
+        max_acc = max(max_acc, acc)    
     # save model
     torch.save(model.state_dict(), model_dir_out)
 
 def l1_reg_neuron(model):
+    '''returns sum of all mask weights in the network. Loss scales with model size so adjust lambda accordingly'''
     reg=0.0
     for name, param in model.named_parameters():
         if "mask_scores" in name:
@@ -201,18 +196,12 @@ def prune_pct_neuron_weights(model: nn.Module, sparsity: torch.float, post_prefi
     with torch.no_grad():
         for name, mask in model.named_parameters(): 
             if "mask_scores" in name:
-                prefix = name[:len(name)-12] # name of layer being masked
-                # print(prefix, 'mean: ', mask.mean().item())
-                # print(prefix, 'std: ', mask.std().item())
-                
+                prefix = name[:len(name)-12] # name of layer being masked                
                 binary_mask = model.state_dict()[prefix+'.mask']
                 num_to_keep = math.floor(len(binary_mask)*sparsity) # how many neurons to not prune
                 # prune least important neurons. Prunes mask down to desired percentage
                 if not prune_random:
-                    
                     vals, sorted_idx = mask.sort(descending=True) # pruned weights are already set to 0
-                    # print(vals[-5:].item(), vals[:5].item())
-                    # idx_to_keep, _ = idx[:num_to_keep].sort() # return top % row indices, sorted 
                     idx_to_prune = sorted_idx[num_to_keep:]  
                 else: # random pruning. Needs to check which have already been pruned
                     # find weights which aren't pruned yet
@@ -223,8 +212,7 @@ def prune_pct_neuron_weights(model: nn.Module, sparsity: torch.float, post_prefi
                 # Remove mask
                 binary_mask[idx_to_prune] = 0.0
                 mask[idx_to_prune] = 0.0
-                model.load_state_dict({prefix+'.mask': binary_mask, name: mask}, strict=False)
-                
+                model.load_state_dict({prefix+'.mask': binary_mask, name: mask}, strict=False)         
 
 
 def test_pruned_model(pruned_model_dir):
@@ -234,8 +222,9 @@ def test_pruned_model(pruned_model_dir):
         model.load_state_dict(torch.load(pruned_model_dir), strict=False) # saved model doesn't have mask scores
         # model = model.to(device)
         print('loaded pretrained weights')
+    else:
+        print('\n\n*************MODEL DIRECTORY NOT FOUND*****************\n\n')
     inputs = torch.rand((1,28**2)).to(device)
-    # outputs = model(inputs) # purely for debugging purposes to see if intermediate representations are truly sparse (we haven't removed weights yet)
     # sparsity appears legit
     test_batch_size=16
     test_data = torchvision.datasets.MNIST('/home/ahoffman/research/transformers/examples/alex/struct-pruning/emmental', train=False, download=True,
@@ -261,13 +250,8 @@ def test_pruned_model(pruned_model_dir):
         for name, param in model.named_parameters():
             if 'mask' in name and 'scores' not in name:
                 param.fill_(1.0)
-        # for neuron in range(len(mask)):
-            # if mask[neuron] < 0.5: # not 1.0, therefore prune
         pre_weight[pruned_idx,:] = 0.0
         pre_bias[pruned_idx] = 0.0
-                # post_weight[:,data] = 0.0
-        print('\nZeroed weights')
-        # outputs = model(inputs)
         # mnist_eval(model, test_loader, device)
 
         # prune post weights
@@ -278,6 +262,7 @@ def test_pruned_model(pruned_model_dir):
 
 
 def train_model(model_dir:str):
+    '''trains model for 10 epochs and saves it in mode_dir'''
     device='cuda'
     model = MLPNeuronMasked((28**2,300,100,10)).to(device)
     train_data = torchvision.datasets.MNIST('/home/ahoffman/research/transformers/examples/alex/struct-pruning/emmental', train=True, download=True,
@@ -301,8 +286,6 @@ def train_model(model_dir:str):
         if 'mask' in name:
             param.requires_grad=False
     for epoch in tqdm(range(10)):
-        # mnist_train(model_small, optimizer, train_loader, device, 0.0)
-        # mnist_eval(model_small, test_loader, device)
         mnist_train(model, optimizer, train_loader, device, 0.0)
         mnist_eval(model, test_loader, device)
     torch.save(model.state_dict(), model_dir)
@@ -317,7 +300,7 @@ if __name__=="__main__":
     # train_model(os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_pruned.pt"))
 
     mnist_neuron_pruning(6, [0.001], os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
-     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_pruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02])
+     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02])
     
     
     # mnist_neuron_pruning(6, [0.001], os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model.pt"),
