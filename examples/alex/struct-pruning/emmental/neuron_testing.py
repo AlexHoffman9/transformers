@@ -3,22 +3,20 @@ import time
 import math
 import random
 from tqdm import tqdm
+import datetime
 
 import torch
 import torch.nn as nn
 from torch.nn import Parameter
 from torch.optim import SGD
 from torch.utils.data import SubsetRandomSampler
-
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    from tensorboardX import SummaryWriter
 
 from modules.binarizer import L1ColBinarizer, L1RowBinarizer, MagnitudeBinarizer
 from modules.masked_nn import MaskedLinear
-
-# TODO: check regularization now that i realized that I wasn't using the train loader (doh!)
-    # train with regularization and prune and compare to random pruning, also compare to no regularization
-        # plot results and summarize for presentation
-        # port to BERT if it's promising!
-
 
 
 # # Returns mask of inputs matrix
@@ -82,9 +80,11 @@ def mnist_eval(model, test_loader, device):
         print('eval acc: ', accuracy.item())
         return accuracy.item()
 
-def mnist_train(model, optimizer, train_loader, device, reg_lambda):
+def mnist_train(model, optimizer, train_loader, device, reg_lambda, steps, writer):
     model.train()
-    cum_loss=0.0
+    logging_steps=10
+    prev_cum_loss = torch.zeros(1, dtype=torch.float, requires_grad=False).to(device)
+    cum_loss = torch.zeros(1, dtype=torch.float, requires_grad=False).to(device)
     for idx, batch in enumerate(tqdm(train_loader, desc='Training')):
         batch_x = torch.flatten(batch[0], start_dim=1).to(device) # flatten 2d image for fc network
         batch_y = batch[1].to(device)
@@ -96,9 +96,23 @@ def mnist_train(model, optimizer, train_loader, device, reg_lambda):
         loss.backward()
         optimizer.step()
         cum_loss+=loss
-    return cum_loss
+        steps += 1
+        if (idx+1)%logging_steps == 0: # log after training logging_steps during this epoch
+            avg_loss = (cum_loss-prev_cum_loss)/logging_steps
+            prev_cum_loss.data.copy_(cum_loss.data)
+            writer.add_scalar('training_loss', avg_loss, steps) 
+    # average final steps of epoch
+    if (idx)%logging_steps != 0: # if we didn't just plot
+        avg_loss = (cum_loss-prev_cum_loss)/(idx%logging_steps)
+        prev_cum_loss = cum_loss
+        writer.add_scalar('training_loss', avg_loss, steps) 
+    return steps, cum_loss
 
 def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out, sparsity_sched):
+    dt = datetime.datetime.now()
+    dt_string = dt.strftime("%m-%d-(%H:%M)")+str(sparsity_sched[-1])
+    logdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'neuron_testing_board', dt_string)
+    writer = SummaryWriter(log_dir=logdir)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # device='cpu'
     train_data = torchvision.datasets.MNIST('/home/ahoffman/research/transformers/examples/alex/struct-pruning/emmental', train=True, download=True,
@@ -110,8 +124,8 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=32, shuffle=True)
     
     # use a smaller fine-tuning dataset during pruning to simulate transfer learning
-    transfer_size_factor = 10
-    transfer_sampler = SubsetRandomSampler(range(int(len(train_data)/transfer_size_factor))) # only sample from first tenth of dataset for transfer set
+    transfer_size_factor = .1
+    transfer_sampler = SubsetRandomSampler(range(math.floor(len(train_data)*transfer_size_factor))) # only sample from first tenth of dataset for transfer set
     transfer_loader = torch.utils.data.DataLoader(train_data, batch_size=32, sampler=transfer_sampler) 
 
     test_batch_size=128
@@ -134,8 +148,12 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
     sparsity=1.0
     optimizer = torch.optim.SGD(model.parameters(), lr=.01)
     print('\nTraining with reg lambda=', reg_lambda)
-
-    for sparsity in sparsity_sched: # prune to each sparsity and fine tune
+    acc = mnist_eval(model, test_loader, device)
+    steps = 0
+    writer.add_scalar('eval_acc', acc, steps)
+    writer.add_scalar('sparsity', sparsity_sched[0], steps)
+    for i in range(len(sparsity_sched)): # prune to each sparsity and fine tune
+        sparsity = sparsity_sched[i]
         # learn mask scores for an epoch
         for name, param in model.named_parameters():
             if "mask_scores" in name: # learn mask scores, mask stays frozen
@@ -145,11 +163,8 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
         # train scores for one epoch
         for epoch in range(1): 
             print('\nlearning scores, sparsity:', sparsity)
-            mnist_eval(model, test_loader, device)
-            cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda)
-        # torch.save(model.state_dict(), model_dir) # added to save pretrained model
+            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer)
 
-        # fine tune weights for an epoch
         for name, param in model.named_parameters():
             if "mask" in name: # freeze mask scores and mask
                 param.requires_grad = False
@@ -157,20 +172,26 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
                 param.requires_grad = True
         # prune less important neurons and fine tune
         post_prefixes = {'lin1': 'lin2', 'lin2':'lin3'} # gotta be a better way than this....
-        prune_pct_neuron_weights(model, sparsity, post_prefixes, prune_random=False) # random pruning enabled to compare to my method
+        layerwise_neuron_prune(model, sparsity, post_prefixes, prune_random=False) # random pruning enabled to compare to my method
         print('acc after pruning to sparsity:', sparsity)
-        mnist_eval(model, test_loader, device)
+        acc=mnist_eval(model, test_loader, device)
+        writer.add_scalar('eval_acc', acc, steps)
+        writer.add_scalar('sparsity', sparsity, steps)
         for epoch in range(1):
-            cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda) # masks frozen so regularization has no effect
+            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer) # masks frozen so regularization has no effect
         print('fine-tuned acc after pruning to sparsity:', sparsity, 'and one epoch fine-tuning')
-        mnist_eval(model, test_loader, device)
+        acc = mnist_eval(model, test_loader, device)
+        writer.add_scalar('eval_acc', acc, steps)
+        writer.add_scalar('sparsity', sparsity, steps)
     
     print('\n\nDone pruning, now training to convergence')
     max_acc=0
     convergence=0
     while convergence<2:
-        cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda) # masks frozen so regularization has no effect
+        steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer) # masks frozen so regularization has no effect
         acc = mnist_eval(model, test_loader, device)
+        writer.add_scalar('eval_acc', acc, steps)
+        writer.add_scalar('sparsity', sparsity, steps)
         if acc <= max_acc+.002:
             convergence += 1
         else:
@@ -189,7 +210,7 @@ def l1_reg_neuron(model):
 
 
 # currently debugging pruning algorithm to make sure sparsity is met, binary masks stay binary, and mask scores are learned properly. Want to see results eventually as well... and transfer to bert next
-def prune_pct_neuron_weights(model: nn.Module, sparsity: torch.float, post_prefixes:dict, prune_random=False):
+def layerwise_neuron_prune(model: nn.Module, sparsity: torch.float, post_prefixes:dict, prune_random=False):
     '''
     prunes to targeted sparsity at each prunable layer\
     '''
@@ -263,6 +284,7 @@ def test_pruned_model(pruned_model_dir):
 
 def train_model(model_dir:str):
     '''trains model for 10 epochs and saves it in mode_dir'''
+    writer = SummaryWriter(logdir=os.path.join(os.path.abspath(__file__),'model_train_board'))
     device='cuda'
     model = MLPNeuronMasked((28**2,300,100,10)).to(device)
     train_data = torchvision.datasets.MNIST('/home/ahoffman/research/transformers/examples/alex/struct-pruning/emmental', train=True, download=True,
@@ -285,8 +307,9 @@ def train_model(model_dir:str):
     for name, param in model.named_parameters():
         if 'mask' in name:
             param.requires_grad=False
+    steps = 0
     for epoch in tqdm(range(10)):
-        mnist_train(model, optimizer, train_loader, device, 0.0)
+        steps, loss = mnist_train(model, optimizer, train_loader, device, steps, writer)
         mnist_eval(model, test_loader, device)
     torch.save(model.state_dict(), model_dir)
         
@@ -299,7 +322,7 @@ if __name__=="__main__":
     
     # train_model(os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_pruned.pt"))
 
-    mnist_neuron_pruning(6, [0.001], os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
+    mnist_neuron_pruning(1, [0.001], os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
      os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02])
     
     
