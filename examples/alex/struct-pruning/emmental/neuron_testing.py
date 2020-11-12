@@ -58,8 +58,34 @@ class MLPNeuronMasked(nn.Module):
         x = nn.functional.relu(x)
         x = x * self.lin2.mask_scores * self.lin2.mask
         x = self.lin3(x)
-        return x   
+        return x
 
+class MLPNeuronMaskedGradient(MLPNeuronMasked):
+    ''' modifying neuron masked network to calculate scores with taylor expansion and abs value delta cost minimization a la Molchanov 2017'''
+    def __init__(self,
+        dims:tuple,
+    ):
+        super(MLPNeuronMaskedGradient, self).__init__(dims)
+        # dim1,dim2,dim3,classes = dims
+        # self.lin1 = nn.Linear(in_features=dim1, out_features=dim2, bias=True)
+        # self.lin1.mask_scores = Parameter(torch.ones(dim2, dtype=torch.float), requires_grad=True) # scores to regularize which will choose neurons
+        # self.lin1.mask = Parameter(torch.ones(dim2, dtype=torch.float, requires_grad=False), requires_grad=False) # binary mask to disable neurons after pruning. Could instead remove weights to reshape neuron layer
+        # self.lin2 = nn.Linear(in_features=dim2, out_features=dim3, bias=True)
+        # self.lin2.mask_scores = Parameter(torch.ones(dim3, dtype=torch.float), requires_grad=True) # change back to true after getting pretrained
+        # self.lin2.mask = Parameter(torch.ones(dim3, dtype=torch.float, requires_grad=False), requires_grad=False)
+        # self.lin3 = nn.Linear(in_features=dim3, out_features=classes, bias=True)
+        # self.in_features = dim1
+        # self.classes = classes
+    
+    def forward(self, inputs):
+        x = self.lin1(inputs)
+        x = nn.functional.relu(x)
+        x = x * self.lin1.mask # we don't want to mult by mask scores here
+        x = self.lin2(x)
+        x = nn.functional.relu(x)
+        x = x * self.lin2.mask
+        x = self.lin3(x)
+        return x
 
 # test with mnist
 import torchvision
@@ -80,7 +106,8 @@ def mnist_eval(model, test_loader, device):
         print('eval acc: ', accuracy.item())
         return accuracy.item()
 
-def mnist_train(model, optimizer, train_loader, device, reg_lambda, steps, writer):
+def mnist_train(model, optimizer, train_loader, device, reg_lambda, steps, writer, regularizer=None, pruning_method='gradient_ranked'):
+    if regularizer == None: regularizer=l1_reg_neuron
     model.train()
     logging_steps=10
     prev_cum_loss = torch.zeros(1, dtype=torch.float, requires_grad=False).to(device)
@@ -90,10 +117,12 @@ def mnist_train(model, optimizer, train_loader, device, reg_lambda, steps, write
         batch_y = batch[1].to(device)
         optimizer.zero_grad()
         out = model(batch_x)
-        l1_reg = l1_reg_neuron(model) # changed for pretrained model
-        ce_loss = nn.functional.cross_entropy(out, batch_y)
+        l1_reg = regularizer(model) if regularizer!=None else 0.0 # changed for pretrained model. order of 300 for group lasso, 400->8 for l1 neuron (num of masks)
+        ce_loss = nn.functional.cross_entropy(out, batch_y) # on order of .02
         loss = ce_loss + reg_lambda * l1_reg
         loss.backward()
+        if pruning_method == 'gradient_ranked': # update mask scores
+            update_neuron_gradient_scores(model)
         optimizer.step()
         cum_loss+=loss
         steps += 1
@@ -108,10 +137,45 @@ def mnist_train(model, optimizer, train_loader, device, reg_lambda, steps, write
         writer.add_scalar('training_loss', avg_loss, steps) 
     return steps, cum_loss
 
-def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out, sparsity_sched):
+def l1_reg_neuron(model):
+    '''returns sum of all mask weights in the network. Loss scales with model size so adjust lambda accordingly'''
+    reg=0.0
+    for name, param in model.named_parameters():
+        if "mask_scores" in name:
+            reg += torch.sum(param.abs()) # l1 norm is sum of weights
+    return reg
+
+def group_lasso(model: torch.nn.Module, pruning_method='row'):
+    '''
+    L1 regularization of groups of weights in weight matrix to encourage sparsity \\
+    row=True regularizes rows, row=False regularizes cols\\
+    ignores bias, layernorm, embedding params\\
+    
+    '''
+    reg, layer_count = 0.0, 0.0
+    group_dim=1
+    filter_prune = ['lin','weight']
+    if pruning_method == 'col':
+        group_dim=0
+    for name, param in model.named_parameters():
+        if all(key in name for key in filter_prune): # only prune linear weight matrix
+            norms = torch.norm(param, dim=group_dim)
+            reg += torch.sum(norms)
+            layer_count += 1.0
+    return reg
+
+def mnist_neuron_pruning(num_fine_tune_epochs, reg_lambda, model_dir, model_dir_out, sparsity_sched, pruning_method='l1_neuron', prune_random=False):
+    '''Pruning script for MLP model and MNIST dataset. \\
+    Starting from pretrained network, iteratively prunes groups of weights via neuron pruning or row pruning \\
+    Currently fine tunes on small percentage of training set, will add option to transfer to different dataset.
+    
+    pruning_method: l1_neuron or group_lasso
+    '''
+
     dt = datetime.datetime.now()
-    dt_string = dt.strftime("%m-%d-(%H:%M)")+str(sparsity_sched[-1])
-    logdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'neuron_testing_board', dt_string)
+    dt_string = dt.strftime("%m-%d-(%H:%M)")+str(sparsity_sched[-1])+pruning_method
+    if prune_random: dt_string += 'random'+str(reg_lambda)
+    logdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tboard', dt_string)
     writer = SummaryWriter(log_dir=logdir)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # device='cpu'
@@ -125,6 +189,8 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
     
     # use a smaller fine-tuning dataset during pruning to simulate transfer learning
     transfer_size_factor = .1
+    print('fine tuned on 1/10 of training data')
+
     transfer_sampler = SubsetRandomSampler(range(math.floor(len(train_data)*transfer_size_factor))) # only sample from first tenth of dataset for transfer set
     transfer_loader = torch.utils.data.DataLoader(train_data, batch_size=32, sampler=transfer_sampler) 
 
@@ -136,53 +202,66 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
                                     (0.1307,), (0.3081,))
                                 ]))
     test_loader = torch.utils.data.DataLoader(test_data, batch_size=test_batch_size, shuffle=True)
-    # for reg_lambda in lambdas:
-    reg_lambda = lambdas[0]
+
     model = MLPNeuronMasked((28*28, 300, 100, 10)).to(device)
+    if pruning_method=='gradient_ranked':
+        model = MLPNeuronMaskedGradient((28*28, 300, 100, 10)).to(device)
+    post_prefixes = {'lin1': 'lin2', 'lin2':'lin3'} # what is the following layer?
     # load pretrained model if possible to save training time
     if os.path.exists(model_dir):
         model.load_state_dict(torch.load(model_dir), strict=False) # saved model doesn't have mask scores
         model = model.to(device)
         print('loaded pretrained weights from ', model_dir)
-    target_dims = {'lin1.mask_scores': 28*28-50}
+
+    # pruning parameters
+    pruning_regularizer = {'l1_neuron': l1_reg_neuron, 'group_lasso': group_lasso, 'gradient_ranked':None}
     sparsity=1.0
     optimizer = torch.optim.SGD(model.parameters(), lr=.01)
+    regularizer = pruning_regularizer[pruning_method]
     print('\nTraining with reg lambda=', reg_lambda)
     acc = mnist_eval(model, test_loader, device)
     steps = 0
     writer.add_scalar('eval_acc', acc, steps)
-    writer.add_scalar('sparsity', sparsity_sched[0], steps)
+    writer.add_scalar('sparsity', 1.0, steps)
+    writer.add_scalar('acc_v_sparsity', acc, 0)
     for i in range(len(sparsity_sched)): # prune to each sparsity and fine tune
         sparsity = sparsity_sched[i]
-        # learn mask scores for an epoch
-        for name, param in model.named_parameters():
-            if "mask_scores" in name: # learn mask scores, mask stays frozen
-                param.requires_grad = True
-            else:                     # freeze weights
-                param.requires_grad = False
-        # train scores for one epoch
-        for epoch in range(1): 
-            print('\nlearning scores, sparsity:', sparsity)
-            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer)
+        # only train neuron scores if necessary
+        if pruning_method=='l1_neuron':
+            # learn mask scores for an epoch
+            for name, param in model.named_parameters():
+                if "mask_scores" in name: # learn mask scores, mask stays frozen
+                    param.requires_grad = True
+                else:                     # freeze weights
+                    param.requires_grad = False
+            # train scores for one epoch
+            for epoch in range(1): 
+                print('\nlearning scores, sparsity:', sparsity)
+                steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer, regularizer)
 
+            # prune least important neurons and fine tune
+            layerwise_neuron_prune(model, sparsity, post_prefixes, prune_random)
+        elif pruning_method == 'gradient_ranked':
+            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer, regularizer, pruning_method='gradient_ranked')
+            layerwise_neuron_prune(model, sparsity, post_prefixes, prune_random)
+        else:
+            layerwise_group_prune(model, sparsity, post_prefixes, prune_random, group='row')
+        print('acc after pruning to sparsity:', sparsity)
+        acc=mnist_eval(model, test_loader, device)
+        writer.add_scalar('eval_acc', acc, steps)
+        writer.add_scalar('sparsity', sparsity, steps)
         for name, param in model.named_parameters():
             if "mask" in name: # freeze mask scores and mask
                 param.requires_grad = False
             else:                # freeze weights
                 param.requires_grad = True
-        # prune less important neurons and fine tune
-        post_prefixes = {'lin1': 'lin2', 'lin2':'lin3'} # gotta be a better way than this....
-        layerwise_neuron_prune(model, sparsity, post_prefixes, prune_random=False) # random pruning enabled to compare to my method
-        print('acc after pruning to sparsity:', sparsity)
-        acc=mnist_eval(model, test_loader, device)
-        writer.add_scalar('eval_acc', acc, steps)
-        writer.add_scalar('sparsity', sparsity, steps)
-        for epoch in range(1):
-            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer) # masks frozen so regularization has no effect
+        for epoch in range(num_fine_tune_epochs):
+            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer, regularizer) # masks frozen so regularization has no effect
         print('fine-tuned acc after pruning to sparsity:', sparsity, 'and one epoch fine-tuning')
         acc = mnist_eval(model, test_loader, device)
         writer.add_scalar('eval_acc', acc, steps)
         writer.add_scalar('sparsity', sparsity, steps)
+        writer.add_scalar('acc_v_sparsity', acc, i+1)
     
     print('\n\nDone pruning, now training to convergence')
     max_acc=0
@@ -196,33 +275,26 @@ def mnist_neuron_pruning(num_fine_tune_epochs, lambdas, model_dir, model_dir_out
             convergence += 1
         else:
             convergence = 0
-        max_acc = max(max_acc, acc)    
+        max_acc = max(max_acc, acc)
+    writer.add_scalar('acc_v_sparsity', max_acc, len(sparsity_sched)+1)
     # save model
     torch.save(model.state_dict(), model_dir_out)
-
-def l1_reg_neuron(model):
-    '''returns sum of all mask weights in the network. Loss scales with model size so adjust lambda accordingly'''
-    reg=0.0
-    for name, param in model.named_parameters():
-        if "mask_scores" in name:
-            reg += torch.sum(param.abs()) # l1 norm is sum of weights
-    return reg
 
 
 # currently debugging pruning algorithm to make sure sparsity is met, binary masks stay binary, and mask scores are learned properly. Want to see results eventually as well... and transfer to bert next
 def layerwise_neuron_prune(model: nn.Module, sparsity: torch.float, post_prefixes:dict, prune_random=False):
     '''
-    prunes to targeted sparsity at each prunable layer\
+    prunes to targeted sparsity at each prunable layer
     '''
     with torch.no_grad():
-        for name, mask in model.named_parameters(): 
+        for name, mask_scores in model.named_parameters(): 
             if "mask_scores" in name:
                 prefix = name[:len(name)-12] # name of layer being masked                
                 binary_mask = model.state_dict()[prefix+'.mask']
                 num_to_keep = math.floor(len(binary_mask)*sparsity) # how many neurons to not prune
                 # prune least important neurons. Prunes mask down to desired percentage
                 if not prune_random:
-                    vals, sorted_idx = mask.sort(descending=True) # pruned weights are already set to 0
+                    vals, sorted_idx = mask_scores.sort(descending=True) # pruned weights are already set to 0
                     idx_to_prune = sorted_idx[num_to_keep:]  
                 else: # random pruning. Needs to check which have already been pruned
                     # find weights which aren't pruned yet
@@ -232,8 +304,48 @@ def layerwise_neuron_prune(model: nn.Module, sparsity: torch.float, post_prefixe
                     idx_to_prune = random.sample(prunable_idx, num_to_prune)
                 # Remove mask
                 binary_mask[idx_to_prune] = 0.0
-                mask[idx_to_prune] = 0.0
-                model.load_state_dict({prefix+'.mask': binary_mask, name: mask}, strict=False)         
+                mask_scores[idx_to_prune] = 0.0
+                # model.load_state_dict({prefix+'.mask': binary_mask, name: mask_scores}, strict=False) 
+
+def update_neuron_gradient_scores(model, use_abs_value=True):
+    with torch.no_grad():
+        for name, mask_scores in model.named_parameters():
+            if 'mask_scores' in name:
+                prefix = name[:len(name)-12] # name of layer being masked
+                # BUG: weight_param does not contain grad data. It is just a shallow copy of tensor data. I cant figure out how to manipulate model tensor directly by name... 
+                w = [p for n,p in model.named_parameters() if (prefix+'.weight') in n]
+                weight_param=w[0]
+                # score = h*dL/dh = Wx * dL/dh = sum wi * xi dL/dh = sum( wi*dL/dwi)
+                weighted_grads = weight_param * weight_param.grad
+                if use_abs_value:
+                    weighted_grads = torch.abs(weighted_grads)
+                mask_scores += torch.sum(weighted_grads,dim=1) # sum weights which feed each neuron to get neuron score
+
+def layerwise_group_prune(model: nn.Module, sparsity: torch.float, post_prefixes:dict, prune_random=False, group='row'):
+    '''
+    prunes to targeted sparsity at each prunable layer, ranking by magniutude of row or column of weights
+    '''
+    with torch.no_grad():
+        for name, weight in model.named_parameters(): 
+            if "mask_scores" in name:
+                prefix = name[:len(name)-12] # name of layer being masked       
+                binary_mask = model.state_dict()[prefix+'.mask']
+                weight = model.state_dict()[prefix+'.weight']
+                num_to_keep = math.floor(len(binary_mask)*sparsity) # how many neurons to leave
+                group_dim = 1 if group=='row' else 0
+                if not prune_random:
+                    _, sorted_idx = weight.norm(dim=group_dim).sort(descending=True) # sort by group dim 
+                    idx_to_prune = sorted_idx[num_to_keep:]
+                else: # random pruning. Needs to check which have already been pruned
+                    # find weights which aren't pruned yet
+                    num_active = int(binary_mask.sum())
+                    num_to_prune = num_active-num_to_keep
+                    prunable_idx = [idx for idx in range(len(binary_mask)) if binary_mask[idx]==1.0]
+                    idx_to_prune = random.sample(prunable_idx, num_to_prune)
+                # Remove mask
+                binary_mask[idx_to_prune] = 0.0
+                model.load_state_dict({prefix+'.mask': binary_mask}, strict=False)         
+        
 
 
 def test_pruned_model(pruned_model_dir):
@@ -322,12 +434,28 @@ if __name__=="__main__":
     
     # train_model(os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_pruned.pt"))
 
-    mnist_neuron_pruning(1, [0.001], os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
-     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02])
+    mnist_neuron_pruning(1, .001, os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02],
+    pruning_method='gradient_ranked', prune_random=False)
+
+    # for val in [.0001, .0002, .0005, .001, .002]:
+    # for val in [.0002, .0002, .0002]:
+    #     mnist_neuron_pruning(1, val, os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
+    #     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02],
+    #     pruning_method='l1_neuron', prune_random=True)
+    # for val in [.0001, .0001, .0001]:
+    #     mnist_neuron_pruning(1, val, os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
+    #     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02],
+    #     pruning_method='l1_neuron', prune_random=False)
+    # for val in [.0001, .0001, .0001]:
+    #     mnist_neuron_pruning(1, val, os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
+    #     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02],
+    #     pruning_method='group_lasso', prune_random=True)
+    # for val in [.0001, .0001, .0001]:
+    #     mnist_neuron_pruning(1, val, os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100.pt"),
+    #     os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model-300-100_transferpruned.pt"), [0.9,0.7,.5,.3,.2,.1,.075,.05,.04,.03,.02],
+    #     pruning_method='group_lasso', prune_random=False)
     
-    
-    # mnist_neuron_pruning(6, [0.001], os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model.pt"),
-    #  os.path.join(os.path.dirname(os.path.abspath(__file__)),"mnist_mlp_model_pruned.pt"), [0.9,0.8,0.7,.6,.5,.4,.3,.2,.1])
 
 
 
