@@ -7,4 +7,8 @@ from .modeling_bert_masked import (
     MaskedBertForTokenClassification,
     MaskedBertModel,
 )
+from .configuration_bert_neuronmasked import NeuronMaskedBertConfig
+from .modeling_bert_neuron import (
+    NeuronMaskedBertForSequenceClassification,
+)
 from .modules import *

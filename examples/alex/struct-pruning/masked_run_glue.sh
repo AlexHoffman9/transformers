@@ -3,8 +3,13 @@
 SERIALIZATION_DIR=./glue_out
 GLUE_DATA=/home/ahoffman/research/transformers/data/glue/MRPC
 export CUDA_VISIBLE_DEVICES=0
-/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
---model_type bert --num_train_epochs 10 --per_gpu_train_batch_size 16 --initial_warmup 8 --max_seq_length 256 --learning_rate 2e-5 --tfwriter_dir_append sota_attempt
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
+# --model_type bert --num_train_epochs 10 --per_gpu_train_batch_size 16 --initial_warmup 8 --max_seq_length 128 --learning_rate 2e-5 --tfwriter_dir_append sota_attempt
+
+# neuron masked bert...does it run?
+/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+--model_type neuron_bert --num_train_epochs 4 --per_gpu_train_batch_size 8 --initial_warmup 8 --max_seq_length 128 --learning_rate 2e-5 --tfwriter_dir_append neuron_test \
+--logging_steps 5
 
 # See if pruning is affecting gradient prop
 # /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \

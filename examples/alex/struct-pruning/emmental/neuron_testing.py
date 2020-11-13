@@ -219,8 +219,10 @@ def mnist_neuron_pruning(num_fine_tune_epochs, reg_lambda, model_dir, model_dir_
     optimizer = torch.optim.SGD(model.parameters(), lr=.01)
     regularizer = pruning_regularizer[pruning_method]
     print('\nTraining with reg lambda=', reg_lambda)
-    acc = mnist_eval(model, test_loader, device)
+    print('warmup epoch')
     steps = 0
+    steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer, regularizer, pruning_method='gradient_ranked')
+    acc = mnist_eval(model, test_loader, device)
     writer.add_scalar('eval_acc', acc, steps)
     writer.add_scalar('sparsity', 1.0, steps)
     writer.add_scalar('acc_v_sparsity', acc, 0)
@@ -242,7 +244,6 @@ def mnist_neuron_pruning(num_fine_tune_epochs, reg_lambda, model_dir, model_dir_
             # prune least important neurons and fine tune
             layerwise_neuron_prune(model, sparsity, post_prefixes, prune_random)
         elif pruning_method == 'gradient_ranked':
-            steps, cum_loss = mnist_train(model, optimizer, transfer_loader, device, reg_lambda, steps, writer, regularizer, pruning_method='gradient_ranked')
             layerwise_neuron_prune(model, sparsity, post_prefixes, prune_random)
         else:
             layerwise_group_prune(model, sparsity, post_prefixes, prune_random, group='row')
@@ -304,8 +305,12 @@ def layerwise_neuron_prune(model: nn.Module, sparsity: torch.float, post_prefixe
                     idx_to_prune = random.sample(prunable_idx, num_to_prune)
                 # Remove mask
                 binary_mask[idx_to_prune] = 0.0
-                mask_scores[idx_to_prune] = 0.0
+                mask_scores[idx_to_prune] = 0.0 # reset mask scores so they can adjust to new pruned configuration. This maybe undesirable if not finetuning for a full epoch, or if pruning while training
+                # print('actual sparsity layer ',prefix,': ',torch.sum(binary_mask/len(binary_mask))) # verify that correct number is being pruned
                 # model.load_state_dict({prefix+'.mask': binary_mask, name: mask_scores}, strict=False) 
+                w = [p for n,p in model.named_parameters() if (prefix+'.weight') in n]
+                weight_param=w[0]
+                print('mean\n',weight_param.mean(), 'std\n',weight_param.std())
 
 def update_neuron_gradient_scores(model, use_abs_value=True):
     with torch.no_grad():
