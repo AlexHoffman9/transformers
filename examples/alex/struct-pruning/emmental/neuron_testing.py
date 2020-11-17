@@ -282,7 +282,7 @@ def mnist_neuron_pruning(num_fine_tune_epochs, reg_lambda, model_dir, model_dir_
     torch.save(model.state_dict(), model_dir_out)
 
 
-# currently debugging pruning algorithm to make sure sparsity is met, binary masks stay binary, and mask scores are learned properly. Want to see results eventually as well... and transfer to bert next
+
 def layerwise_neuron_prune(model: nn.Module, sparsity: torch.float, post_prefixes:dict, prune_random=False):
     '''
     prunes to targeted sparsity at each prunable layer

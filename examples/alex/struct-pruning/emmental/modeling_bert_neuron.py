@@ -367,14 +367,14 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
-        self.neuron_scores = nn.Parameter(torch.ones(config.intermediate_size, dtype=torch.float), requires_grad=False)
-        self.neuron_mask = nn.Parameter(torch.ones(config.intermediate_size, dtype=torch.float), requires_grad=False)
+        self.neuron_scores = nn.Parameter(torch.zeros(config.intermediate_size, dtype=torch.float), requires_grad=False)
+        self.neuron_mask = nn.Parameter(torch.ones(config.intermediate_size, dtype=torch.float), requires_grad=True)
 
     # changed forward here to multiply by mask in the intermediate FFN. This is likely the most prunable layer so starting here.
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
-        hidden_states = hidden_states*self.mask
+        hidden_states = hidden_states*self.neuron_mask
         return hidden_states
 
 

@@ -1,5 +1,4 @@
-# TODO: setup args to actually load in my new neuron masked model and see if i can train it as a normal bert model
-# then try random pruning according to the sparsity schedule (might need to change to make it simplr iterative version)
+# TODO: try random pruning according to the sparsity schedule (might need to change to make it simpler iterative version)
 # then add in gradient training step in training to learn neuron scores
 
 import argparse
@@ -19,7 +18,7 @@ from tqdm import tqdm, trange
 
 from emmental import MaskedBertConfig, MaskedBertForSequenceClassification
 # new
-from emmental import NeuronMaskedBertConfig, NeuronMaskedBertForSequenceClassification
+from emmental import NeuronMaskedBertConfig, NeuronMaskedBertForSequenceClassification, update_neuron_gradient_scores_mask, global_neuron_prune, layerwise_neuron_prune, layerwise_group_prune
 from transformers import (
     WEIGHTS_NAME,
     AdamW,
@@ -97,7 +96,10 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         dt = datetime.datetime.now()
-        dt_string = dt.strftime("%m-%d-(%H:%M)")+args.pruning_method+'_'+str(args.final_threshold)+args.tfwriter_dir_append
+        appender=''
+        if args.tfwriter_dir_append is not None:
+            appender=args.tfwriter_dir_append
+        dt_string = dt.strftime("%m-%d-(%H:%M)")+args.pruning_method+'_'+str(args.final_threshold)+appender
         tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir,dt_string))
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
@@ -137,7 +139,33 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
         },
     ]
 
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    optimizer_neuron_parameters = [
+        {
+            "params": [p for n,p in model.named_parameters() if "neuron_mask" in n and p.requires_grad],
+            "lr": 0.0 # don't change neuron mask with gradient
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if "neuron_mask" not in n and p.requires_grad and not any(nd in n for nd in no_decay)
+            ],
+            "lr": args.learning_rate,
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if "neuron_mask" not in n and p.requires_grad and any(nd in n for nd in no_decay)
+            ],
+            "lr": args.learning_rate,
+            "weight_decay": 0.0,
+        },
+
+    ]
+
+    optimizer = AdamW(optimizer_neuron_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
@@ -311,8 +339,6 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
             else:
                 loss.backward()
 
-            # gradients have backpropagated, so update scores
-
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0 or (
                 # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -325,6 +351,11 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    # print('Checking neuron scores')
+                    # for name, param in model.named_parameters():
+                    #     if 'neuron_scores' in name:
+                    #         if any(key in name for key in ['1','4','8']):
+                    #             print(name, param[:10])
                     tb_writer.add_scalar("threshold", threshold, global_step)
                     for name, param in model.named_parameters():
                         if not param.requires_grad:
@@ -344,6 +375,29 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
 
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
+
+                # update neuron scores of bert model, and prune if it is time
+                if args.model_type =='neuron_bert':
+                    if 'gradient_ranked' in args.pruning_method:
+                        if 'signed' in args.pruning_method:
+                            # update_neuron_gradient_scores(model, use_abs_value=False)
+                            update_neuron_gradient_scores_mask(model, use_abs_value=False)
+                        else:
+                            # update_neuron_gradient_scores(model)
+                            update_neuron_gradient_scores_mask(model, use_abs_value=True)
+                    if (((global_step+1) % args.fine_tune_steps) == 0) and (threshold < 1.0):  # done-fine tuning, time to prune model again
+                        if 'random' in args.pruning_method:
+                            layerwise_neuron_prune(model, threshold, prune_random=True)
+                        elif 'reverse' in args.pruning_method:
+                            layerwise_neuron_prune(model, threshold, descending=False)
+                        elif 'global' in args.pruning_method:
+                            global_neuron_prune(model, threshold)
+                        elif 'gradient_ranked' in args.pruning_method:
+                            print('pruning pruning pruning')
+                            layerwise_neuron_prune(model, threshold)
+                        elif args.pruning_method == 'row':
+                            layerwise_group_prune(model, threshold, group='row')
+
                 model.zero_grad()
                 global_step += 1
 
@@ -408,6 +462,8 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+            
+
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -576,7 +632,7 @@ def main():
     )
     parser.add_argument(
         "--model_type",
-        default='masked_bert',
+        default='neuron_bert',
         # default = 'bert',
         type=str,
         # required=True,
@@ -668,11 +724,11 @@ def main():
         "--initial_threshold", default=1.0, type=float, help="Initial value of the threshold (for scheduling)."
     )
     parser.add_argument(
-        "--final_threshold", default=1.0, type=float, help="Final value of the threshold (for scheduling)."
+        "--final_threshold", default=0.1, type=float, help="Final value of the threshold (for scheduling)."
     )
     parser.add_argument(
         "--initial_warmup",
-        default=100,
+        default=0,
         type=int,
         help="Run `initial_warmup` * `warmup_steps` steps of threshold warmup during which threshold stays"
         "at its `initial_threshold` value (sparsity schedule).",
@@ -687,7 +743,9 @@ def main():
 
     parser.add_argument(
         "--pruning_method",
-        default="magnitude",
+        # default="magnitude",
+        # default='gradient_ranked',
+        default='global_gradient_ranked',
         type=str,
         help="Pruning Method (l0 = L0 regularization, magnitude = Magnitude pruning, topK = Movement pruning, sigmoied_threshold = Soft movement pruning).",
     )
@@ -798,6 +856,8 @@ def main():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--tfwriter_dir_append", type=str, default='', help="add this to the end of the tfwriter directory name")
+
+    parser.add_argument("--fine_tune_steps", type=int, default=10, help="number of fine-tuning steps between pruning iterations")
 
     args = parser.parse_args()
 

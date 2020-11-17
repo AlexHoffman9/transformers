@@ -6,11 +6,41 @@ export CUDA_VISIBLE_DEVICES=0
 # /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
 # --model_type bert --num_train_epochs 10 --per_gpu_train_batch_size 16 --initial_warmup 8 --max_seq_length 128 --learning_rate 2e-5 --tfwriter_dir_append sota_attempt
 
-# neuron masked bert...does it run?
-/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
---model_type neuron_bert --num_train_epochs 4 --per_gpu_train_batch_size 8 --initial_warmup 8 --max_seq_length 128 --learning_rate 2e-5 --tfwriter_dir_append neuron_test \
---logging_steps 5
+# no pruning baseline
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --num_train_epochs 6 --per_gpu_train_batch_size 8 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method gradient_ranked --fine_tune_steps 400 --final_threshold 1.0
 
+# harsh random pruning
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --num_train_epochs 6 --per_gpu_train_batch_size 8 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method random --fine_tune_steps 400 --final_threshold 0.3
+
+
+# global grad ranked  pruning
+/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+--model_type neuron_bert --num_train_epochs 1 --per_gpu_train_batch_size 8 --warmup_steps 0 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+--logging_steps 200 --pruning_method global_gradient_ranked --fine_tune_steps 400 --final_threshold 0.01
+
+/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+--model_type bert --num_train_epochs 1 --per_gpu_train_batch_size 8 --warmup_steps 0 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+--logging_steps 200 --pruning_method gradient_ranked --fine_tune_steps 400 --final_threshold 0.01
+
+# grad ranked  pruning
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --num_train_epochs 6 --per_gpu_train_batch_size 8 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method gradient_ranked --fine_tune_steps 400 --final_threshold 0.01
+
+# random neuron pruning
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --num_train_epochs 6 --per_gpu_train_batch_size 8 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method random --fine_tune_steps 400 --final_threshold 0.7
+
+
+# row pruning
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --num_train_epochs 6 --per_gpu_train_batch_size 8 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method row --fine_tune_steps 400 --final_threshold 0.3
 # See if pruning is affecting gradient prop
 # /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_pruning_glue.py \
 # --final_threshold 0.9 --pruning_method magnitude --num_train_epochs 10  --initial_warmup 8
