@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import math
 import random
+import time
+
+# def get_layer_names(model, suffix):
+#     for name
+
 
 def update_neuron_gradient_scores(model, use_abs_value=True):
     '''updates scores for bert model linear layers. Sums gradients of all incoming weights of neuron'''
@@ -69,13 +74,16 @@ def global_neuron_prune(model, sparsity: torch.float, prune_random=False, dims=(
         actual_sparsity = actual_sparsity/12
         print('actual sparsity: ', actual_sparsity)
 
-def pruning_score_from_latencies(latencies:torch.Tensor, dimensions: list):
+def pruning_score_from_latencies(latencies:torch.Tensor, dimensions):
     '''Outputs expected latency improvement score for pruning each layer\\
         Inputs: latencies dimension tensor (max_dim), dimensions tensor (n_layers)'''
     # assuming latency table is already smoothed...We can just subtract pruned latency from current latency. Bigger difference = bigger score
-    scores = torch.zeros_like(dimensions)
+    scores = torch.zeros(len(dimensions))
     for layer,dim in enumerate(dimensions):
-        improvement = latencies[dim-1] - latencies[dim]
+        if dim>=2:
+            improvement = latencies[dim-1] - latencies[dim-2] # latency improvement, expected to be positive, so add to neuron scores
+        else:
+            improvement = 0
         scores[layer] = improvement
     if len(dimensions)==1:
         return scores[0]
@@ -94,52 +102,83 @@ def pruning_score_from_latencies(latencies:torch.Tensor, dimensions: list):
         # don't need to globally sort anymore, but now we have no idea of relative neuron importance between layers, so it isn't really global pruning...
         # general problem is that once we prune, the layerwise statistics (latency, global importance) change, so we need to update both (recalc latency, resort importance scores)
         # bad idea is to use score threshold instead of sparsity threshold, because then i don't need to do any global sorting. Downside is calibration of score threshold (more hparams)
-def global_neuron_prune_iterative(model, sparsity: torch.float, prune_random=False, dims=(12,3072), latencies):
+def global_neuron_prune_iterative(model, sparsity, prune_random=False, dims=(12,3072), latencies=[1]*12, prune_n=1, latency_lambda=1.0):
+    # neuron scores param names
+    neuron_score_names = [p for p,l in model.named_parameters() if "neuron_scores" in p]
+    binary_mask_names = [p for p,l in model.named_parameters() if "neuron_mask" in p]
+
     n_layers=dims[0]
     ffn_width=dims[1]
     total_neurons = n_layers*ffn_width
     global_scores = torch.Tensor(n_layers*ffn_width) # preallocate tensor for all scores
-    idx=0
     # concatenate all scores
     with torch.no_grad():
         actual_sparsity=42.0 # dummy
         while actual_sparsity > sparsity:
-            current_layer_widths, pruning_scores = [], []
+            then=time.time()
+            current_layer_widths, pruning_scores = torch.zeros(n_layers, dtype=int), torch.zeros(n_layers, dtype=torch.float)
+            idx=0
             # prune n lowest neurons (n>1 will make this faster since sorting is slow). Could replace resorting with updating probabilities for a stochastic approach
-            for name, neuron_scores in model.named_parameters():
-                if "neuron_scores" in name:
-                    current_width = int(torch.sum(neuron_scores != -1e6).item()) # masked neurons have score == -1e9, so this gives us current number of neurons
-                    pruning_score = pruning_score_from_latencies(latencies, dimensions=[current_width])
-                    global_scores[idx*ffn_width:(idx+1)*ffn_width] = neuron_scores - pruning_score # subtract latency improvement score from importance score
-                    current_layer_widths.append(current_width)
-                    pruning_scores.append(pruning_score)
-                    idx += 1
-                    # this loop is done
+            # for name, neuron_scores in model.named_parameters():
+            #     if "neuron_scores" in name:
+            #         current_width = int(torch.sum(neuron_scores != -1e6).item()) # masked neurons have score == -1e9, so this gives us current number of neurons
+            #         pruning_score = pruning_score_from_latencies(latencies, dimensions=[current_width])
+            #         global_scores[idx*ffn_width:(idx+1)*ffn_width] = neuron_scores - pruning_score # subtract latency improvement score from importance score
+            #         current_layer_widths[idx] = current_width
+            #         pruning_scores[idx] = pruning_score.item()
+            #         idx += 1
+            for name in neuron_score_names:
+                neuron_scores = model.state_dict()[name]
+                current_width = int(torch.sum(neuron_scores != -1e6).item()) # masked neurons have score == -1e9, so this gives us current number of neurons
+                pruning_score = pruning_score_from_latencies(latencies, dimensions=[current_width])
+                # normalize scores within each layer so they are globally comparable if one layer is biased to higher or lower scores
+                # BUG can't set neuron scores to -1e6 anymore
+                global_scores[idx*ffn_width:(idx+1)*ffn_width] = neuron_scores/torch.norm(neuron_scores) + latency_lambda*pruning_score # high pruning_score = higher improvement in latency
+                current_layer_widths[idx] = current_width
+                pruning_scores[idx] = pruning_score.item()
+                idx += 1
             
-            # now have tensor of all neuron scores, time to sort
-            # TODO just prune bottom neuron. get idx of neuron to locate layer. use python line to substitute n in bert.encoder.layer.n.ffn to get layer name and manually turn off neuron
+            # sort global neuron scores
             sorted_scores, idxs = global_scores.sort(descending=True)
-            num_to_keep = math.floor(len(global_scores)*sparsity)
+            num_to_keep = sum(current_layer_widths) - prune_n # number of active neurons - number to prune per iteration
             threshold = sorted_scores[num_to_keep-1]
 
-            # prune each layer given threshold
-            idx = 0
-            print('global pruning with latency weighted layers, sparsity:', sparsity)
-            actual_sparsity=0.0
-            for name, neuron_scores in model.named_parameters():
-                if "neuron_scores" in name:
-                    prefix = name[:len(name)-14] # name of layer being masked                
-                    binary_mask = model.state_dict()[prefix+'.neuron_mask']
-                    pruned_idx = (neuron_scores*normed_lat_lookup[idx])<threshold
-                    binary_mask[pruned_idx] = 0.0
-                    neuron_scores[pruned_idx] = -1e6
-                    sprs=binary_mask.sum()/len(binary_mask)
-                    print('layer ',idx, ' sparsity = ', sprs)
-                    actual_sparsity+=sprs
-                    idx+=1
-                    
-            actual_sparsity = actual_sparsity/12
-            print('actual sparsity: ', actual_sparsity)
+            # finding layer, idx from global idx
+            pruned_global_idx = idxs[num_to_keep:num_to_keep+prune_n]
+            pruning_locations = [(pruned_idx//ffn_width, pruned_idx%ffn_width) for pruned_idx in pruned_global_idx]
+            # prune specified locations
+            for layer,idx in pruning_locations:
+                neuron_scores = model.state_dict()[neuron_score_names[layer]]
+                neuron_scores[idx] = -1e6
+                binary_mask = model.state_dict()[binary_mask_names[layer]]
+                binary_mask[idx] = 0.0
+                current_layer_widths[layer] = int(binary_mask.sum()) # take actual sum of sparsity 
+
+
+            # DEBUG: which layers did we prune from? What were the latency scores?
+            # pruned_global_idx = idxs[num_to_keep:num_to_keep+prune_n]
+            # pruned_layers = pruned_global_idx // ffn_width
+            # print("Pruning latency scores: ", pruning_scores)
+            # print("pruned layers: ", pruned_layers)
+
+            #BUG set threshold assuming every score will be unique but ended up seeing multiple neurons at same score, causing them all to meet threshold and get pruned
+            # prune each layer given threshold. Alternative to this would be to get indices of pruned neurons, translate to layer, idx and directly prune (better for small number of prune_n)
+            # idx = 0
+            # # print('global pruning with latency weighted layers, sparsity:', sparsity)
+            # for name, neuron_scores in model.named_parameters():
+            #     if "neuron_scores" in name:
+            #         prefix = name[:len(name)-14] # name of layer being masked                
+            #         binary_mask = model.state_dict()[prefix+'.neuron_mask']
+            #         pruned_idx = (neuron_scores-pruning_scores[idx])<threshold # calculated pruning scores on first pass through the network
+            #         binary_mask[pruned_idx] = 0.0
+            #         neuron_scores[pruned_idx] = -1e6
+            #         current_layer_widths[idx] = int(binary_mask.sum().item())
+            #         idx+=1
+            actual_sparsity = float(torch.sum(current_layer_widths))/total_neurons
+            now = time.time()
+            # print(now-then)
+        print('pruned to ', actual_sparsity, ' sparsity')
+        print('Layer widths: ', current_layer_widths)
 
 def layerwise_neuron_prune(model: nn.Module, sparsity: torch.float, prune_random=False):
     '''

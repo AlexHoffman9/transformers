@@ -16,9 +16,13 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Tenso
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
+import torch.autograd.profiler as profiler
+
 from emmental import MaskedBertConfig, MaskedBertForSequenceClassification
+from bert_profiler import noisy_linear_step, flops_linear
+
 # new
-from emmental import NeuronMaskedBertConfig, NeuronMaskedBertForSequenceClassification, update_neuron_gradient_scores_mask, global_neuron_prune, layerwise_neuron_prune, layerwise_group_prune
+from emmental import NeuronMaskedBertConfig, NeuronMaskedBertForSequenceClassification, update_neuron_gradient_scores_mask, global_neuron_prune, layerwise_neuron_prune, layerwise_group_prune, global_neuron_prune_iterative
 from transformers import (
     WEIGHTS_NAME,
     AdamW,
@@ -245,7 +249,10 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
         disable=args.local_rank not in [-1, 0],
     )
     set_seed(args)  # Added here for reproductibility
-    for _ in train_iterator:
+    init_steps = args.warmup_steps*args.initial_warmup
+    final_steps = args.warmup_steps*args.final_warmup
+    sparsity=args.initial_threshold
+    for t_epoch in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
 
@@ -385,23 +392,40 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                         else:
                             # update_neuron_gradient_scores(model)
                             update_neuron_gradient_scores_mask(model, use_abs_value=True)
+                    
                     if (((global_step+1) % args.fine_tune_steps) == 0) and (threshold < 1.0):  # done-fine tuning, time to prune model again
+                    # if t_epoch > 0 and step==0:  # prune on start of epoch
+                        just_pruned=True
+                        sparsity=threshold
                         if 'random' in args.pruning_method:
                             layerwise_neuron_prune(model, threshold, prune_random=True)
                         elif 'reverse' in args.pruning_method:
                             layerwise_neuron_prune(model, threshold, descending=False)
-                        elif 'global' in args.pruning_method:
+                        elif 'global_iterative' in args.pruning_method:
+                            print('doing global iterative pruning')
+                            if 'noisy_linear' in args.pruning_method:
+                                print('using fake linear step latency grid')
+                                latencies = noisy_linear_step(dim=3072, noise=0.0, lpf=11)
+                            elif 'flops' in args.pruning_method:
+                                print('using flops model so no weight given to different layers')
+                                latencies = flops_linear(fc_dims=(768*4,768), pruned_dim_idx=0)
+                            global_neuron_prune_iterative(model, sparsity, prune_random=False, dims=(12,3072), latencies=latencies, prune_n=4)
+                        elif 'global_oneshot' in args.pruning_method:
+                            print('doing global one shot pruning')
                             global_neuron_prune(model, threshold)
                         elif 'gradient_ranked' in args.pruning_method:
                             print('pruning pruning pruning')
                             layerwise_neuron_prune(model, threshold)
                         elif args.pruning_method == 'row':
                             layerwise_group_prune(model, threshold, group='row')
+                    else:
+                        just_pruned=False
 
                 model.zero_grad()
                 global_step += 1
-
-                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                
+                # log one step early using global_step+1. Also log right after pruning
+                if (args.local_rank in [-1, 0] and args.logging_steps > 0 and (global_step+1) % args.logging_steps == 0) or just_pruned:
                     logs = {}
                     if (
                         args.local_rank == -1 and args.evaluate_during_training
@@ -436,7 +460,7 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
                         else:
                             logs["loss/instant_ce"] = loss.item() - regu_lambda * logs["loss/regularization"]
                     logging_loss = tr_loss
-
+                    logs["sparsity"]=sparsity
                     for key, value in logs.items():
                         tb_writer.add_scalar(key, value, global_step)
                     print(json.dumps({**logs, **{"step": global_step}}))
@@ -467,6 +491,14 @@ def train(args, train_dataset, model, tokenizer, teacher=None):
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
+
+    # add model dimensions to tensorboard
+    layer=0
+    for name, mask in model.named_parameters():
+        if 'neuron_mask' in name:
+            width = int(mask.sum())
+            tb_writer.add_scalar('Layer Widths', width, global_step=layer)
+            layer += 1
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
@@ -648,6 +680,7 @@ def main():
     parser.add_argument(
         "--task_name",
         default='mrpc',
+        # default='qnli',
         type=str,
         # required=True,
         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()),
@@ -809,7 +842,7 @@ def main():
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument(
         "--num_train_epochs",
-        default=6.0,
+        default=3.0,
         type=float,
         help="Total number of training epochs to perform.",
     )
@@ -819,10 +852,10 @@ def main():
         type=int,
         help="If > 0: set total number of training steps to perform. Override num_train_epochs.",
     )
-    parser.add_argument("--warmup_steps", default=50, type=int, help="Linear warmup over warmup_steps.")
+    parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
 
-    parser.add_argument("--logging_steps", type=int, default=50, help="Log every X updates steps.")
-    parser.add_argument("--save_steps", type=int, default=1000, help="Save checkpoint every X updates steps.")
+    parser.add_argument("--logging_steps", type=int, default=200, help="Log every X updates steps.")
+    parser.add_argument("--save_steps", type=int, default=4000, help="Save checkpoint every X updates steps.")
     parser.add_argument(
         "--eval_all_checkpoints",
         action="store_true",
@@ -857,7 +890,7 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--tfwriter_dir_append", type=str, default='', help="add this to the end of the tfwriter directory name")
 
-    parser.add_argument("--fine_tune_steps", type=int, default=10, help="number of fine-tuning steps between pruning iterations")
+    parser.add_argument("--fine_tune_steps", type=int, default=50, help="number of fine-tuning steps between pruning iterations")
 
     args = parser.parse_args()
 

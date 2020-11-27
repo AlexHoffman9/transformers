@@ -17,14 +17,30 @@ export CUDA_VISIBLE_DEVICES=0
 # --logging_steps 200 --pruning_method random --fine_tune_steps 400 --final_threshold 0.3
 
 
-# global grad ranked  pruning
-/data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
---model_type neuron_bert --num_train_epochs 1 --per_gpu_train_batch_size 8 --warmup_steps 0 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
---logging_steps 200 --pruning_method global_gradient_ranked --fine_tune_steps 400 --final_threshold 0.01
+# global grad ranked  pruning SST2
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --task_name MRPC --num_train_epochs 3 --per_gpu_train_batch_size 16 --warmup_steps 50 --initial_warmup 20 --final_warmup 20 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 500 --pruning_method gradient_ranked --fine_tune_steps 1000 --final_threshold 0.05 --data_dir /home/ahoffman/research/transformers/data/glue/SST-2
 
+
+# global grad_ranked oneshot pruning MRPC
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --task_name MRPC --num_train_epochs 10 --per_gpu_train_batch_size 16 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method global_oneshot_gradient_ranked --fine_tune_steps 400 --final_threshold 0.05 --data_dir /home/ahoffman/research/transformers/data/glue/MRPC
+
+# global grad_ranked iterative pruning MRPC using flops
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type neuron_bert --task_name MRPC --num_train_epochs 10 --per_gpu_train_batch_size 16 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method global_iterative_gradient_ranked_flops --fine_tune_steps 400 --final_threshold 0.05 --data_dir /home/ahoffman/research/transformers/data/glue/MRPC
+
+# global grad_ranked iterative pruning MRPC using noisy linear
 /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
---model_type bert --num_train_epochs 1 --per_gpu_train_batch_size 8 --warmup_steps 0 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
---logging_steps 200 --pruning_method gradient_ranked --fine_tune_steps 400 --final_threshold 0.01
+--model_type neuron_bert --task_name MRPC --num_train_epochs 10 --per_gpu_train_batch_size 16 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+--logging_steps 200 --pruning_method global_iterative_gradient_ranked_noisy_linear --fine_tune_steps 400 --final_threshold 0.05 --data_dir /home/ahoffman/research/transformers/data/glue/MRPC
+
+# /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
+# --model_type bert --num_train_epochs 6 --per_gpu_train_batch_size 8 --warmup_steps 50 --initial_warmup 8 --final_warmup 8 --max_seq_length 128 --learning_rate 2e-5 \
+# --logging_steps 200 --pruning_method gradient_ranked --fine_tune_steps 400 --final_threshold 0.0
 
 # grad ranked  pruning
 # /data/ahoffman/anaconda3/envs/torch/bin/python /home/ahoffman/research/transformers/examples/alex/struct-pruning/masked_neuron_pruning_glue.py \
