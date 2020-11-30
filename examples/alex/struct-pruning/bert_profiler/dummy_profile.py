@@ -31,23 +31,28 @@ def noisy_linear_step(dim=768, steps=5, noise=.01, max_lat=1000, small_slope=.1,
         for i in range(lpf_range,dim-lpf_range):
             lpf_latencies[i] = torch.mean(latencies[i-lpf_range:i+lpf_range+1])
         return lpf_latencies
-    return latencies
+    return latencies/latencies.mean()
 
 # really basic flops approximator
 def flops_linear(fc_dims=(768,768), pruned_dim_idx=0):
     max_flops = fc_dims[0]*fc_dims[1]
-    flops = torch.arange(start=0, end=max_flops, step=fc_dims[1-pruned_dim_idx])
-    return flops
+    flops = torch.arange(start=0, end=max_flops, step=fc_dims[1-pruned_dim_idx], dtype=torch.float)
+    return flops/flops.mean()
 
 
 def neuron_score_from_latencies(latencies:torch.Tensor, dimensions: torch.tensor):
     '''Outputs expected latency improvement score for pruning each layer\\
         Inputs: latencies dimension tensor (max_dim), dimensions tensor (n_layers)'''
     # assuming latency table is already smoothed...We can just subtract pruned latency from current latency. Bigger difference = bigger score
-    scores = torch.zeros_like(dimensions)
+    scores = torch.zeros(len(dimensions))
     for layer,dim in enumerate(dimensions):
-        improvement = latencies[dim] - latencies[dim-1]
+        if dim>=2:
+            improvement = latencies[dim-1] - latencies[dim-2] # latency improvement, expected to be positive, so add to neuron scores
+        else:
+            improvement = 0
         scores[layer] = improvement
+    if len(dimensions)==1:
+        return scores[0]
     return scores
 
 def selftest():

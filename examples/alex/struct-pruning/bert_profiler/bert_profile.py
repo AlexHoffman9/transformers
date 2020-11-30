@@ -23,11 +23,14 @@ from transformers import glue_output_modes as output_modes
 from transformers import glue_processors as processors
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
 from parser import build_args
 
 import pandas as pd
+import time, datetime
+import numpy as np
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     if args.local_rank not in [-1, 0] and not evaluate:
@@ -169,7 +172,7 @@ def evaluate_autograd_profiler(args, model, tokenizer, prefix=""):
         return prof_str, prof_stats
 # getting "RuntimeError: Profiler is already enabled on this thread"  error and idk what to do. It happened after I added a torch.num_threads line. But removed line and it still sucks
 
-def main():
+def cprof_main():
     args=build_args()    
 
     # Setup CUDA, GPU & distributed training
@@ -188,7 +191,7 @@ def main():
     args.model_name_or_path = 'bert-base-uncased'
     args.per_gpu_eval_batch_size=1
     argdict = vars(args)
-    argdict['n_trials'] = 1
+    argdict['n_trials'] = 10
     # torch.set_num_threads(32)
 
     
@@ -269,9 +272,122 @@ def main():
     # prof = evaluate(args,model,tokenizer)
     # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
 
+def latency_measurement():
+    args=build_args()    
 
+    # Setup CUDA, GPU & distributed training
+    if args.local_rank == -1 or args.no_cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend="nccl")
+        args.n_gpu = 1
+    args.device = device
+    # args.device = 'cpu'
+
+    # setup for latency test:
+    # args.device='cpu' # jsut want to test cpu for now
+    args.model_name_or_path = 'bert-base-uncased'
+    args.per_gpu_eval_batch_size=1
+    argdict = vars(args)
+    argdict['n_trials'] = 100
+    argdict['n_warmup'] = 10
+    # torch.set_num_threads(8) # single threaded latencies are slower but have much lower std dev so better for testing (since xeon CPU is not realistic scenario anyways)
+ 
+    
+    # Prepare GLUE task
+    args.task_name = args.task_name.lower()
+    if args.task_name not in processors:
+        raise ValueError("Task not found: %s" % (args.task_name))
+    processor = processors[args.task_name]()
+    args.output_mode = output_modes[args.task_name]
+    label_list = processor.get_labels()
+    num_labels = len(label_list)
+    args.model_type = args.model_type.lower()
+    config_class, model_class, tokenizer_class = BertConfig, BertForSequenceClassification, BertTokenizer
+    tokenizer = tokenizer_class.from_pretrained(
+        args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+        cache_dir=args.cache_dir if args.cache_dir else None,
+        do_lower_case=args.do_lower_case,
+    )
+
+    # get batch
+    eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
+    eval_outputs_dirs = (args.output_dir, args.output_dir + "/MM") if args.task_name == "mnli" else (args.output_dir,)
+    for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+        if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+            os.makedirs(eval_output_dir)
+        args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+        # Note that DistributedSampler samples randomly
+        eval_sampler = SequentialSampler(eval_dataset)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+        batch = next(iter(eval_dataloader))
+        batch = tuple(t.to(args.device) for t in batch)
+
+    inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+    if args.model_type != "distilbert":
+        inputs["token_type_ids"] = (
+            batch[2] if args.model_type in ["bert", "masked_bert", "xlnet", "albert"] else None
+        )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
+
+    config = config_class.from_pretrained(
+        args.config_name if args.config_name else args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=args.task_name,
+        num_hidden_layers=2,
+    )
+    
+    print('Device: ', args.device)
+    min_dff=768
+    max_dff=768*8
+    dims_to_test = range(min_dff,max_dff,64)
+    # dims_to_test = [768,868]
+    latencies = np.zeros((len(dims_to_test), args.n_trials), dtype=float)
+    for i, dff in enumerate(tqdm(dims_to_test, desc="profiling")):
+        config.intermediate_size = dff
+        model = model_class(config=config)
+        model.to(args.device)
+        # warmup network to stabilize latencies
+        for j in range(args.n_warmup):
+            out = model(**inputs)
+        for trial in range(args.n_trials):
+            if args.device != 'cpu':
+                torch.cuda.synchronize(args.device)
+            then = time.time()
+            out = model(**inputs)
+            if args.device != 'cpu':
+                torch.cuda.synchronize(args.device)
+            now = time.time()
+            latencies[i,trial] = now-then
+    
+    # process results
+    dt = datetime.datetime.now()
+    dt_string = dt.strftime("%m-%d-(%H:%M:%S)")
+    writer = SummaryWriter(log_dir=os.path.join(os.path.dirname(__file__),'latency_viz', 'inference', dt_string))
+
+    means = np.mean(latencies, axis=1)
+    stds = np.std(latencies, axis=1)
+    mins = np.min(latencies, axis=1)
+    maxes = np.max(latencies, axis=1)
+    # print('latencies ', latencies)moksha
+    print('means ', means)
+    print('stds ', stds)
+
+    # print to tensorboard
+    #TODO: So far latency scales with flops almost perfectly on cpu. Need to test on GPU to get more interesting latency model.. otherwise need to rethink my project. Mobile gpu would offer interesting scaling but not currently available
+    for i in range(len(means)):
+        writer.add_scalar('Mean Observed Latency', means[i], dims_to_test[i])
+        writer.add_scalar('STD Observed Latency', stds[i], dims_to_test[i])
+        writer.add_scalar('Min Observed Latency', mins[i], dims_to_test[i])
+        writer.add_scalar('Max Observed Latency', maxes[i], dims_to_test[i])
+    
+    writer.close()
 if __name__=='__main__':
-    main()
+    # cprof_main()
+    latency_measurement()
 
     # STATSFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),'eval_stats.csv')
     # cProfile.run('main()', STATSFILE)
